@@ -1,0 +1,46 @@
+{
+  "env": [
+    {
+      "PYTHONPATH": {
+        "value": "$GHOSTTY/python",
+        "method": "prepend"
+      }
+    },
+    {
+      "PYTHONPATH": {
+        "value": "$GHOSTTY/python_deps",
+        "method": "prepend"
+      }
+    },
+    {
+      "PATH": {
+        "value": "$GHOSTTY/bin/windows",
+        "method": "prepend",
+        "houdini_os": "windows"
+      }
+    },
+    {
+      "PATH": {
+        "value": "$GHOSTTY/bin/windows/nvim-win64/bin",
+        "method": "prepend",
+        "houdini_os": "windows"
+      }
+    },
+    {
+      "PATH": {
+        "value": "$GHOSTTY/bin/linux",
+        "method": "prepend",
+        "houdini_os": "linux"
+      }
+    },
+    {
+      "PATH": {
+        "value": "$GHOSTTY/bin/linux/nvim-linux64/bin",
+        "method": "prepend",
+        "houdini_os": "linux"
+      }
+    }
+  ],
+  "path": "$GHOSTTY",
+  "load_package_once": true
+}

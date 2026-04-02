@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"C:\\\\Program Files\\\\Side Effects Software\\\\Houdini 21.0.631\\\\packages\\\\viewer_handle_demo\\\\desktop && echo --- && ls C:Program\" FilesSide Effects Softwaresidefx_packagesSideFXLabs21.0python_panels)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl -s https://raw.githubusercontent.com/ghostty-org/ghostty/main/include/ghostty.h)",
+      "Bash(curl:*)",
+      "Bash(python3 -c ':*)",
+      "Bash(powershell:*)",
+      "WebSearch",
+      "Bash(xargs grep:*)",
+      "WebFetch(domain:ghostty.org)"
+    ]
+  }
+}
