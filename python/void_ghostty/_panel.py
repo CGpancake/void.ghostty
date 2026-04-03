@@ -30,10 +30,10 @@ from typing import Optional
 
 try:
     from PySide2.QtWidgets import QWidget, QVBoxLayout, QSplitter, QSizePolicy
-    from PySide2.QtCore import Qt
+    from PySide2.QtCore import Qt, QTimer
 except ImportError:
     from PySide6.QtWidgets import QWidget, QVBoxLayout, QSplitter, QSizePolicy
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import Qt, QTimer
 
 from void_ghostty._terminal import TerminalWidget
 
@@ -84,11 +84,69 @@ def _shell_cmd() -> list[str]:
 
 
 def _claude_cmd() -> list[str]:
-    """Claude Code CLI — falls back to shell if `claude` is not on PATH."""
+    """Claude Code CLI with Houdini context — falls back to shell."""
     import shutil
     if shutil.which("claude"):
-        return ["claude"]
+        # Build a system prompt so Claude knows it's inside Houdini
+        hou_info = ""
+        try:
+            import hou
+            hou_info = (
+                f" Houdini version: {hou.applicationVersionString()}."
+                f" Hip file: {hou.hipFile.path()}."
+            )
+        except Exception:
+            pass
+        prompt = (
+            "You are running inside SideFX Houdini as part of the Void Ghostty"
+            " embedded terminal panel. The user is a Houdini artist/TD."
+            f"{hou_info}"
+            " When relevant, prefer Houdini-aware answers (HScript, VEX,"
+            " Python hou module, HDAs, SOPs, etc.)."
+        )
+        return ["claude", "--system-prompt", prompt]
     return _shell_cmd()
+
+
+def _houdini_env() -> dict:
+    """Build environment for PTY processes with Houdini context."""
+    env = os.environ.copy()
+    env["TERM"] = "xterm-256color"
+    env["COLORTERM"] = "truecolor"
+    env["VG_HOUDINI"] = "1"
+    try:
+        import hou
+        env["HOUDINI_VERSION"] = hou.applicationVersionString()
+        hip = hou.hipFile.path()
+        if hip and hip != "untitled.hip":
+            env["HIP"] = os.path.dirname(hip)
+        env["HOUDINI_TEMP_DIR"] = hou.getenv("HOUDINI_TEMP_DIR", "")
+    except Exception:
+        pass
+    return env
+
+
+def _houdini_cwd() -> str:
+    """Return the best working directory for spawned terminals.
+
+    Houdini sets $HIP to the directory of the current .hip file and
+    $JOB to the project root.  We prefer the hip file directory, then
+    $JOB, then the GHOSTTY package root, then the user's home.
+    """
+    try:
+        import hou
+        hip_path = hou.hipFile.path()
+        if hip_path and hip_path != "untitled.hip":
+            hip_dir = os.path.dirname(hip_path)
+            if os.path.isdir(hip_dir):
+                return hip_dir
+    except Exception:
+        pass
+    for var in ("HIP", "JOB", "GHOSTTY"):
+        val = os.environ.get(var, "")
+        if val and os.path.isdir(val):
+            return val
+    return os.path.expanduser("~")
 
 
 # ---------------------------------------------------------------------------
@@ -131,14 +189,16 @@ class VoidGhosttyPanel(QWidget):
         # Top row: horizontal splitter Neovim | Claude Code
         h_split = QSplitter(Qt.Horizontal, v_split)
 
-        self._nvim_pane   = TerminalWidget(cmd=_nvim_cmd(),   parent=h_split)
-        self._claude_pane = TerminalWidget(cmd=_claude_cmd(), parent=h_split)
+        cwd = _houdini_cwd()
+        env = _houdini_env()
+        self._nvim_pane   = TerminalWidget(cmd=_nvim_cmd(),   cwd=cwd, env=env, parent=h_split)
+        self._claude_pane = TerminalWidget(cmd=_claude_cmd(), cwd=cwd, env=env, parent=h_split)
         h_split.addWidget(self._nvim_pane)
         h_split.addWidget(self._claude_pane)
         h_split.setSizes([600, 400])
 
         # Bottom shell
-        self._shell_pane = TerminalWidget(cmd=_shell_cmd(), parent=v_split)
+        self._shell_pane = TerminalWidget(cmd=_shell_cmd(), cwd=cwd, env=env, parent=v_split)
 
         v_split.addWidget(h_split)
         v_split.addWidget(self._shell_pane)
@@ -146,16 +206,28 @@ class VoidGhosttyPanel(QWidget):
 
         root_layout.addWidget(v_split)
 
-        # Start all three panes
-        self._nvim_pane.start()
-        self._claude_pane.start()
-        self._shell_pane.start()
-
-        # Start pynvim sync thread (Phase 5)
-        self._start_nvim_sync()
+        # Defer PTY starts until after the widget is laid out (avoids
+        # blocking Houdini's UI thread during ConPTY spawn and prevents
+        # zero-size grid calculations).
+        QTimer.singleShot(0, self._start_panes)
 
     # ------------------------------------------------------------------
-    # pynvim sync (Phase 5)
+    # Deferred pane startup
+    # ------------------------------------------------------------------
+
+    def _start_panes(self) -> None:
+        """Start PTY processes after the widget has been laid out."""
+        if self._shell_pane is not None:
+            self._shell_pane.start()
+        # Stagger nvim/claude to avoid simultaneous ConPTY spawns
+        if self._nvim_pane is not None:
+            QTimer.singleShot(100, self._nvim_pane.start)
+        if self._claude_pane is not None:
+            QTimer.singleShot(200, self._claude_pane.start)
+
+    # ------------------------------------------------------------------
+    # pynvim sync (Phase 5) — disabled: spawns duplicate nvim process.
+    # Needs redesign to connect to the existing nvim PTY via socket.
     # ------------------------------------------------------------------
 
     def _start_nvim_sync(self) -> None:

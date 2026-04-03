@@ -10,7 +10,8 @@
       "Bash(powershell:*)",
       "WebSearch",
       "Bash(xargs grep:*)",
-      "WebFetch(domain:ghostty.org)"
+      "WebFetch(domain:ghostty.org)",
+      "Bash(cat /d/VoidMonolith/Ghostty/validation_phase*.py)"
     ]
   }
 }
