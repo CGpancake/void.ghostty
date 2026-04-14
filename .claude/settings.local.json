@@ -11,7 +11,32 @@
       "WebSearch",
       "Bash(xargs grep:*)",
       "WebFetch(domain:ghostty.org)",
-      "Bash(cat /d/VoidMonolith/Ghostty/validation_phase*.py)"
+      "Bash(cat /d/VoidMonolith/Ghostty/validation_phase*.py)",
+      "WebFetch(domain:github.com)",
+      "Bash(find D:\\\\VoidMonolith\\\\Ghostty:*)",
+      "Bash(ls:*)",
+      "Bash(grep -E \"\\\\.h$\")",
+      "Bash(xargs wc:*)",
+      "Bash(git diff:*)",
+      "Bash(grep -r \"^import\\\\|^from\" /d/VoidMonolith/Ghostty/python/void_ghostty/*.py)",
+      "Bash(python:*)",
+      "Read(//d D:/VoidMonolith/**)",
+      "Bash(dumpbin /exports bin/windows/vg.dll)",
+      "Bash(python_deps/winpty/winpty.cp311-win_amd64.pyd)",
+      "Bash(nm -D \"D:\\\\VoidMonolith\\\\Ghostty\\\\bin\\\\windows\\\\vg.dll\")",
+      "Bash(python3.11 -c ':*)",
+      "Bash(where cl:*)",
+      "Read(//c/Program Files \\(x86\\)/Microsoft Visual Studio//**)",
+      "Read(//c/Program Files/Microsoft Visual Studio//**)",
+      "Bash(cmd:*)",
+      "Bash(n\\\\\"\")",
+      "Bash(echo \"EXIT:$?\")",
+      "Read(//d/VoidMonolith/**)",
+      "Read(//d/VoidMonolith/Crucible/**)",
+      "Bash(grep \"\\\\.py$\")",
+      "Bash(find:*)",
+      "Bash(awk '{print $5, $9}')",
+      "Bash(du -sh /d/VoidMonolith/Ghostty/python_deps/*)"
     ]
   }
 }

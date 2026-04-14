@@ -1,25 +1,19 @@
-"""Void Ghostty — panel construction (Phases 3–6).
+"""Void Ghostty — panel construction.
 
-Three-pane layout:
-  Pane 0 — Neovim (node-aware)            top-left
-  Pane 1 — Claude Code CLI               top-right
-  Pane 2 — Shell (always free mode)       bottom
+Default layout: single in-process Python REPL pane (HouPythonWidget).
 
-    +---------------------+------------------+
-    |  Neovim             |  Claude Code     |
-    |  (node-aware)       |  CLI             |
-    +---------------------+------------------+
-    |  Shell                                 |
-    +----------------------------------------+
+Keyboard shortcuts
+------------------
+  Ctrl+Shift+H  — split current pane right (adds new Python REPL)
+  Ctrl+Shift+B  — split current pane below (adds new Python REPL)
+  Ctrl+Shift+X  — close current pane (never closes the last pane)
+  Ctrl+Shift+T  — replace current pane with shell (bash / cmd.exe)
+  Ctrl+Shift+P  — replace current pane with Python REPL
 
-Node modes (Phase 6):
-  free    — no node link (default)
-  follow  — tracks Houdini node selection via event-loop callback
-  pinned  — locked to a specific node by sessionId
-
-pynvim sync (Phase 5):
-  NvimSync background thread keeps the Neovim buffer in sync with the
-  registered node's 'code' parm.
+Pane types
+----------
+  HouPythonWidget  — in-process Python REPL, full hou.* access, default pane
+  TerminalWidget   — libghostty-vt PTY pane: shell subprocess
 """
 
 from __future__ import annotations
@@ -29,15 +23,46 @@ import weakref
 from typing import Optional
 
 try:
-    from PySide2.QtWidgets import QWidget, QVBoxLayout, QSplitter, QSizePolicy
+    from PySide2.QtWidgets import (
+        QWidget, QVBoxLayout, QSplitter, QSizePolicy,
+        QApplication,
+    )
+    from PySide2.QtGui import QKeySequence, QShortcut
     from PySide2.QtCore import Qt, QTimer
 except ImportError:
-    from PySide6.QtWidgets import QWidget, QVBoxLayout, QSplitter, QSizePolicy
+    from PySide6.QtWidgets import (
+        QWidget, QVBoxLayout, QSplitter, QSizePolicy,
+        QApplication,
+    )
+    from PySide6.QtGui import QKeySequence, QShortcut
     from PySide6.QtCore import Qt, QTimer
 
 from void_ghostty._terminal import TerminalWidget
+from void_ghostty._hou_python import HouPythonWidget
+from void_ghostty._config import load_config as _load_config
 
-# Weak reference to the active panel so register() can notify it.
+# Config loaded once at panel startup — drives keybindings
+_CFG = _load_config()
+
+# Map Ghostty keybind action names → Qt key sequence strings.
+# User can override via keybind = ctrl+shift+h=split_right in Ghostty config.
+_DEFAULT_SHORTCUTS = {
+    "split_right":    "Ctrl+Shift+H",
+    "split_down":     "Ctrl+Shift+B",
+    "close_surface":  "Ctrl+Shift+X",
+    "new_shell":      "Ctrl+Shift+T",   # VoidGhostty-specific action
+    "new_python":     "Ctrl+Shift+P",   # VoidGhostty-specific action
+}
+
+def _shortcut(action: str) -> str:
+    """Return Qt key sequence string for a panel action, respecting config overrides."""
+    # Ghostty config uses lowercase "ctrl+shift+h"; Qt needs "Ctrl+Shift+H"
+    raw = _CFG.keybinds.get(action, "")
+    if raw:
+        return "+".join(p.capitalize() for p in raw.split("+"))
+    return _DEFAULT_SHORTCUTS.get(action, "")
+
+# Weak reference to the active panel so open_shell() and external callers can reach it.
 _panel_ref: Optional[weakref.ref] = None
 
 
@@ -51,61 +76,10 @@ def get_panel() -> Optional["VoidGhosttyPanel"]:
 # Command helpers
 # ---------------------------------------------------------------------------
 
-def _nvim_cmd() -> list[str]:
-    """Return the command list to launch Neovim.
-
-    Searches bundled runtimes first, falls back to system nvim.
-    Handles both old (nvim-win64 / nvim-linux64) and new
-    (nvim-win64 / nvim-linux-x86_64) release directory naming.
-    """
-    ghostty = os.environ.get("GHOSTTY", "")
-    if os.name == "nt":
-        candidates = [
-            os.path.join(ghostty, "bin", "windows", "nvim-win64", "bin", "nvim.exe"),
-        ]
-        fallback = "nvim.exe"
-    else:
-        candidates = [
-            os.path.join(ghostty, "bin", "linux", "nvim-linux-x86_64", "bin", "nvim"),
-            os.path.join(ghostty, "bin", "linux", "nvim-linux64",       "bin", "nvim"),
-        ]
-        fallback = "nvim"
-
-    for path in candidates:
-        if os.path.exists(path):
-            return [path]
-    return [fallback]
-
-
 def _shell_cmd() -> list[str]:
     if os.name == "nt":
         return ["cmd.exe"]
     return [os.environ.get("SHELL", "/bin/bash")]
-
-
-def _claude_cmd() -> list[str]:
-    """Claude Code CLI with Houdini context — falls back to shell."""
-    import shutil
-    if shutil.which("claude"):
-        # Build a system prompt so Claude knows it's inside Houdini
-        hou_info = ""
-        try:
-            import hou
-            hou_info = (
-                f" Houdini version: {hou.applicationVersionString()}."
-                f" Hip file: {hou.hipFile.path()}."
-            )
-        except Exception:
-            pass
-        prompt = (
-            "You are running inside SideFX Houdini as part of the Void Ghostty"
-            " embedded terminal panel. The user is a Houdini artist/TD."
-            f"{hou_info}"
-            " When relevant, prefer Houdini-aware answers (HScript, VEX,"
-            " Python hou module, HDAs, SOPs, etc.)."
-        )
-        return ["claude", "--system-prompt", prompt]
-    return _shell_cmd()
 
 
 def _houdini_env() -> dict:
@@ -127,12 +101,7 @@ def _houdini_env() -> dict:
 
 
 def _houdini_cwd() -> str:
-    """Return the best working directory for spawned terminals.
-
-    Houdini sets $HIP to the directory of the current .hip file and
-    $JOB to the project root.  We prefer the hip file directory, then
-    $JOB, then the GHOSTTY package root, then the user's home.
-    """
+    """Return the best working directory for spawned terminals."""
     try:
         import hou
         hip_path = hou.hipFile.path()
@@ -161,233 +130,263 @@ class VoidGhosttyPanel(QWidget):
         global _panel_ref
         _panel_ref = weakref.ref(self)
 
-        self._node_path: Optional[str] = None
-        self._mode: str = "free"       # "free" | "follow" | "pinned"
-        self._pinned_session_id: Optional[int] = None
-
-        self._nvim_pane:   Optional[TerminalWidget] = None
-        self._claude_pane: Optional[TerminalWidget] = None
-        self._shell_pane:  Optional[TerminalWidget] = None
-
-        self._nvim_sync = None  # NvimSync instance (Phase 5)
-        self._follow_callback_installed = False
+        self._panes: list[QWidget] = []
+        self._current_pane: Optional[QWidget] = None
+        self._cwd: str = ""
+        self._env: dict = {}
 
         self._build_ui()
+
+        # Register dispatch_to_main callback for background server threads.
+        try:
+            import void_ghostty
+            void_ghostty._ensure_dispatch()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Outer vertical splitter: top row | bottom shell
-        v_split = QSplitter(Qt.Vertical, self)
+        self._cwd = _houdini_cwd()
+        self._env = _houdini_env()
 
-        # Top row: horizontal splitter Neovim | Claude Code
-        h_split = QSplitter(Qt.Horizontal, v_split)
+        repl = HouPythonWidget(parent=self)
+        layout.addWidget(repl)
 
-        cwd = _houdini_cwd()
-        env = _houdini_env()
-        self._nvim_pane   = TerminalWidget(cmd=_nvim_cmd(),   cwd=cwd, env=env, parent=h_split)
-        self._claude_pane = TerminalWidget(cmd=_claude_cmd(), cwd=cwd, env=env, parent=h_split)
-        h_split.addWidget(self._nvim_pane)
-        h_split.addWidget(self._claude_pane)
-        h_split.setSizes([600, 400])
+        self._panes.append(repl)
+        self._current_pane = repl
+        self._install_shortcuts()
+        self._configure_pane(repl)
 
-        # Bottom shell
-        self._shell_pane = TerminalWidget(cmd=_shell_cmd(), cwd=cwd, env=env, parent=v_split)
+        QApplication.instance().focusChanged.connect(self._on_focus_changed)
 
-        v_split.addWidget(h_split)
-        v_split.addWidget(self._shell_pane)
-        v_split.setSizes([600, 200])
-
-        root_layout.addWidget(v_split)
-
-        # Defer PTY starts until after the widget is laid out (avoids
-        # blocking Houdini's UI thread during ConPTY spawn and prevents
-        # zero-size grid calculations).
-        QTimer.singleShot(0, self._start_panes)
+        QTimer.singleShot(0, repl.start)
 
     # ------------------------------------------------------------------
-    # Deferred pane startup
+    # Focus tracking
     # ------------------------------------------------------------------
 
-    def _start_panes(self) -> None:
-        """Start PTY processes after the widget has been laid out."""
-        if self._shell_pane is not None:
-            self._shell_pane.start()
-        # Stagger nvim/claude to avoid simultaneous ConPTY spawns
-        if self._nvim_pane is not None:
-            QTimer.singleShot(100, self._nvim_pane.start)
-        if self._claude_pane is not None:
-            QTimer.singleShot(200, self._claude_pane.start)
-
-    # ------------------------------------------------------------------
-    # pynvim sync (Phase 5) — disabled: spawns duplicate nvim process.
-    # Needs redesign to connect to the existing nvim PTY via socket.
-    # ------------------------------------------------------------------
-
-    def _start_nvim_sync(self) -> None:
-        try:
-            from void_ghostty._nvim_sync import NvimSync
-            nvim_exe = _nvim_cmd()[0]
-            self._nvim_sync = NvimSync(nvim_exe=nvim_exe, node_path=self._node_path)
-            self._nvim_sync.start()
-        except Exception:
-            pass  # Non-fatal — Neovim still runs as a terminal
-
-    # ------------------------------------------------------------------
-    # Node integration (Phases 5–6)
-    # ------------------------------------------------------------------
-
-    def on_node_registered(self, node, config: dict) -> None:
-        """Called by void_ghostty.register(node)."""
-        # In follow mode we may immediately want to switch context
-        if self._mode == "follow":
-            self._apply_node(node.path())
-
-    def set_node(self, node_path: Optional[str]) -> None:
-        """Switch Neovim pane context — called by follow/pinned/drag-drop."""
-        if node_path is None:
-            self._mode = "free"
-            self._node_path = None
-        else:
-            self._mode = "pinned"
-            self._node_path = node_path
-        self._apply_node(node_path)
-
-    def _apply_node(self, node_path: Optional[str]) -> None:
-        """Internal: update sync thread and open node in Network Editor."""
-        self._node_path = node_path
-
-        if self._nvim_sync is not None:
-            # Resolve parm path — look for 'code' or 'snippet' parm first
-            parm_path = self._resolve_code_parm(node_path)
-            self._nvim_sync.set_node(parm_path)
-
-        if node_path:
-            self._open_in_network_editor(node_path)
-
-    @staticmethod
-    def _resolve_code_parm(node_path: Optional[str]) -> Optional[str]:
-        """Return the full parm path for the node's primary code parameter."""
-        if not node_path:
-            return None
-        try:
-            import hou
-            from void_ghostty import _registry
-            node = hou.node(node_path)
-            if node is None:
-                return None
-
-            # Check _vg_config for explicit watch_parms list
-            config = _registry.get(node.sessionId(), {})
-            watch = config.get("watch_parms", [])
-            if watch:
-                parm = node.parm(watch[0])
-                if parm:
-                    return parm.path()
-
-            # Fallback: common code parm names
-            for name in ("code", "snippet", "script", "python", "vex"):
-                parm = node.parm(name)
-                if parm:
-                    return parm.path()
-        except Exception:
-            pass
-        return None
-
-    @staticmethod
-    def _open_in_network_editor(node_path: str) -> None:
-        try:
-            import hou
-            node = hou.node(node_path)
-            if node is None:
+    def _on_focus_changed(self, old_widget, new_widget) -> None:
+        if new_widget is None:
+            return
+        # Walk up the widget tree — focus lands on a child (e.g. _ReplEdit inside
+        # HouPythonWidget) so we can't do a direct `in self._panes` check.
+        w = new_widget
+        while w is not None:
+            if w in self._panes:
+                self._current_pane = w
                 return
-            editor = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
-            if editor:
-                editor.setCurrentNode(node)
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Follow mode (Phase 6)
-    # ------------------------------------------------------------------
-
-    def enable_follow_mode(self) -> None:
-        """Track Houdini node selection; switch context when a registered
-        node is selected in the Network Editor."""
-        self._mode = "follow"
-        if not self._follow_callback_installed:
             try:
-                import hou
-                hou.ui.addEventLoopCallback(self._on_selection_change)
-                self._follow_callback_installed = True
-            except Exception:
-                pass
+                w = w.parent()
+            except RuntimeError:
+                return
 
-    def disable_follow_mode(self) -> None:
-        self._mode = "free"
-        self._remove_follow_callback()
+    # ------------------------------------------------------------------
+    # Keyboard shortcuts
+    # ------------------------------------------------------------------
 
-    def _on_selection_change(self) -> None:
-        """Event loop callback — checks Houdini node selection."""
-        if self._mode != "follow":
-            return
+    def _install_shortcuts(self) -> None:
+        # Fallback QShortcuts — active when a non-terminal widget has focus.
+        # Primary path is callbacks on each pane (see _configure_pane).
+        # Key sequences come from Ghostty config (with built-in defaults).
+        def _bind(action: str, slot) -> None:
+            seq = _shortcut(action)
+            if seq:
+                QShortcut(QKeySequence(seq), self).activated.connect(slot)
+
+        _bind("split_right",   lambda: self._split_pane(Qt.Horizontal))
+        _bind("split_down",    lambda: self._split_pane(Qt.Vertical))
+        _bind("close_surface", self._close_pane)
+        _bind("new_shell",     self._replace_shell_pane)
+        _bind("new_python",    self._replace_python_pane)
+
+    def _configure_pane(self, pane: QWidget) -> None:
+        """Wire multiplexer callbacks so keys fire even while the pane has focus."""
+        pane.mux_split_h       = lambda: self._split_pane(Qt.Horizontal)
+        pane.mux_split_v       = lambda: self._split_pane(Qt.Vertical)
+        pane.mux_close         = self._close_pane
+        pane.mux_replace_shell  = self._replace_shell_pane
+        pane.mux_replace_python = self._replace_python_pane
+
+    # ------------------------------------------------------------------
+    # Split pane management
+    # ------------------------------------------------------------------
+
+    _MAX_PANES = 8  # matches Ghostty's default surface limit
+
+    @staticmethod
+    def _qt_valid(widget) -> bool:
+        """Return False if the underlying C++ Qt object has already been deleted."""
         try:
-            import hou
-            from void_ghostty import _registry
-            selected = hou.selectedNodes()
-            for node in selected:
-                if node.sessionId() in _registry:
-                    self._apply_node(node.path())
-                    return
-        except Exception:
-            pass
+            widget.objectName()
+            return True
+        except RuntimeError:
+            return False
 
-    def _remove_follow_callback(self) -> None:
-        if self._follow_callback_installed:
-            try:
-                import hou
-                hou.ui.removeEventLoopCallback(self._on_selection_change)
-            except Exception:
-                pass
-            self._follow_callback_installed = False
+    def _purge_stale_panes(self) -> None:
+        """Remove any pane references whose C++ objects Qt has already freed."""
+        self._panes = [p for p in self._panes if self._qt_valid(p)]
+        if self._current_pane and not self._qt_valid(self._current_pane):
+            self._current_pane = next((p for p in self._panes), None)
 
-    # ------------------------------------------------------------------
-    # Drag and drop — node path from Network Editor (Phase 6)
-    # ------------------------------------------------------------------
-
-    def dragEnterEvent(self, event) -> None:
-        if event.mimeData().hasText():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dropEvent(self, event) -> None:
-        text = event.mimeData().text().strip()
-        if not text:
-            event.ignore()
+    def _insert_pane(self, new_pane: QWidget, orientation: Qt.Orientation) -> None:
+        """Core splitter insertion logic shared by all split methods."""
+        self._purge_stale_panes()
+        current = self._current_pane
+        if current is None or len(self._panes) >= self._MAX_PANES:
             return
-        # If the dropped text looks like a Houdini node path, set pinned mode
-        if text.startswith("/"):
-            self.set_node(text)
+
+        splitter = QSplitter(orientation)
+        splitter.setChildrenCollapsible(False)
+
+        parent = current.parentWidget()
+        if isinstance(parent, QSplitter):
+            idx = parent.indexOf(current)
+            old_sizes = parent.sizes()
+
+            parent.setUpdatesEnabled(False)
+            splitter.addWidget(current)
+            splitter.addWidget(new_pane)
+            parent.insertWidget(idx, splitter)
+            parent.setSizes(old_sizes)
+            parent.setUpdatesEnabled(True)
         else:
-            event.ignore()
+            lyt = self.layout()
+            self.setUpdatesEnabled(False)
+            lyt.removeWidget(current)
+            splitter.addWidget(current)
+            splitter.addWidget(new_pane)
+            lyt.addWidget(splitter)
+            self.setUpdatesEnabled(True)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.show()
+
+        self._panes.append(new_pane)
+        self._current_pane = new_pane
+        self._configure_pane(new_pane)
+        QTimer.singleShot(0, new_pane.start)
+        QTimer.singleShot(
+            0, lambda p=new_pane: p.setFocus(Qt.OtherFocusReason)
+                                  if self._qt_valid(p) else None
+        )
+
+    def _split_pane(self, orientation: Qt.Orientation) -> None:
+        """Split the current pane with a new Python REPL pane."""
+        new_pane = HouPythonWidget()
+        self._insert_pane(new_pane, orientation)
+
+    def _split_shell_pane(self) -> None:
+        """Open a new shell pane alongside the current pane (used by open_shell() API)."""
+        new_pane = TerminalWidget(
+            cmd=_shell_cmd(), cwd=self._cwd, env=self._env
+        )
+        self._insert_pane(new_pane, Qt.Horizontal)
+
+    def _replace_pane(self, new_pane: QWidget) -> None:
+        """Replace the current pane in-place (no new split)."""
+        self._purge_stale_panes()
+        current = self._current_pane
+        if current is None:
+            return
+
+        parent = current.parentWidget()
+        if isinstance(parent, QSplitter):
+            idx = parent.indexOf(current)
+            sizes = parent.sizes()
+            parent.setUpdatesEnabled(False)
+            parent.insertWidget(idx, new_pane)
+            current.stop()
+            current.setParent(None)     # detaches from splitter → count back to original
+            current.deleteLater()
+            parent.setSizes(sizes)
+            parent.setUpdatesEnabled(True)
+        else:
+            lyt = self.layout()
+            self.setUpdatesEnabled(False)
+            lyt.removeWidget(current)
+            current.stop()
+            current.deleteLater()
+            lyt.addWidget(new_pane)
+            self.setUpdatesEnabled(True)
+
+        self._panes = [new_pane if p is current else p for p in self._panes]
+        self._current_pane = new_pane
+        self._configure_pane(new_pane)
+        QTimer.singleShot(0, new_pane.start)
+        QTimer.singleShot(
+            0, lambda p=new_pane: p.setFocus(Qt.OtherFocusReason)
+                                  if self._qt_valid(p) else None
+        )
+
+    def _replace_shell_pane(self) -> None:
+        """Replace the current pane with a shell terminal (Ctrl+Shift+T)."""
+        new_pane = TerminalWidget(
+            cmd=_shell_cmd(), cwd=self._cwd, env=self._env
+        )
+        self._replace_pane(new_pane)
+
+    def _replace_python_pane(self) -> None:
+        """Replace the current pane with a Python REPL (Ctrl+Shift+P)."""
+        self._replace_pane(HouPythonWidget())
+
+    def _close_pane(self) -> None:
+        """Close the current pane. Never closes the last pane."""
+        self._purge_stale_panes()
+        current = self._current_pane
+        if current is None or len(self._panes) <= 1:
+            return
+
+        parent = current.parentWidget()
+        if not isinstance(parent, QSplitter) or parent.count() != 2:
+            return
+
+        sibling_idx = 1 - parent.indexOf(current)
+        sibling = parent.widget(sibling_idx)
+
+        grandparent = parent.parentWidget()
+        if isinstance(grandparent, QSplitter):
+            gp_idx = grandparent.indexOf(parent)
+            gp_sizes = grandparent.sizes()
+            grandparent.setUpdatesEnabled(False)
+            grandparent.insertWidget(gp_idx, sibling)
+            grandparent.setSizes(gp_sizes)
+            grandparent.setUpdatesEnabled(True)
+        else:
+            lyt = grandparent.layout()
+            self.setUpdatesEnabled(False)
+            lyt.removeWidget(parent)
+            lyt.addWidget(sibling)
+            self.setUpdatesEnabled(True)
+
+        current.stop()
+        current.deleteLater()
+        parent.deleteLater()
+        self._panes.remove(current)
+
+        # Focus sibling if it's a pane, otherwise fall back to first valid pane.
+        next_pane = (
+            sibling if sibling in self._panes
+            else next((p for p in self._panes if self._qt_valid(p)), None)
+        )
+        if next_pane:
+            self._current_pane = next_pane
+            next_pane.setFocus(Qt.OtherFocusReason)
 
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:
-        self._remove_follow_callback()
-        if self._nvim_sync is not None:
-            self._nvim_sync.stop()
-        for pane in (self._nvim_pane, self._claude_pane, self._shell_pane):
-            if pane is not None:
+        for pane in list(self._panes):
+            if self._qt_valid(pane):
                 pane.stop()
         super().closeEvent(event)
 

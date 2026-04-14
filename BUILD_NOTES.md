@@ -356,12 +356,12 @@ void  vg_render_state_update(void* rs, void* term);
 typedef struct {
     uint32_t codepoints[16];
     uint8_t  codepoint_count;
-    uint8_t  col;            // x position
+    uint8_t  col;            // x position (sequential index; set by caller in Python)
     uint8_t  fg_r, fg_g, fg_b;
     uint8_t  bg_r, bg_g, bg_b;
     uint8_t  has_bg;
     uint8_t  bold, italic, inverse, underline, strikethrough, faint;
-    uint8_t  wide;           // 2 = wide character (CJK etc.)
+    uint8_t  _pad;           // pad to even byte count (wide-char detection done in Python via unicodedata)
 } VgCell;
 
 typedef struct {
@@ -494,3 +494,91 @@ GHOSTTY=D:\VoidMonolith\Ghostty
 
 The Houdini package (`void-ghostty.json`) derives all paths from `$GHOSTTY`.
 Copy or symlink `void-ghostty.json` to `$HOUDINI_USER_PREF_DIR/packages/`.
+
+---
+
+## Rendering Performance Research
+
+Research conducted against Ghostling `main.c` at commit `bebca84668947bfc92b9a30ed58712e1c34eee1d` and Ghostty source at commit `0790937d03df6e7a9420c61de91ce520a85fe4ef`. Findings drive the Phase 4 Python rendering path in `_terminal.py`.
+
+### R1 — Ghostling renders ALL rows every frame; no per-row dirty skip (main.c:1078–1176)
+
+```c
+while (ghostty_render_state_row_iterator_next(row_iter)) {
+    // … render cells …
+    bool clean = false;
+    ghostty_render_state_row_set(row_iter,
+        GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, &clean);  // clear AFTER render
+    y += cell_height;
+}
+```
+
+Per-row dirty bits are cleared after rendering, not checked before. All rows are rendered unconditionally each frame.
+
+**Decision for Void Ghostty**: Gate repaints on a Python-level `_vt_dirty` flag only. When dirty, render ALL rows (matching Ghostling). Per-row dirty clearing happens inside `vg_render_row_cells()` in C automatically.
+
+### R2 — Wide/double-width characters: not in Ghostling, not in vg API (main.c:1087, 1165)
+
+Ghostling draws all cells at fixed `cell_width` stride. `GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_WIDTH` does not exist at this commit (confirmed in ABI notes above).
+
+**Decision**: Detect wide chars in Python via `unicodedata.east_asian_width(chr(cp))` → `'W'` or `'F'`. Draw wide cells at `2 * cell_w`. Nerd Font PUA codepoints (U+E000–U+F8FF) are single-width.
+
+### R3 — Grapheme codepoints → UTF-8 string (main.c:1104–1119)
+
+```c
+for (uint32_t i = 0; i < len && pos < 60; i++) {
+    char u8[4];
+    int n = utf8_encode(codepoints[i], u8);
+    memcpy(&text[pos], u8, n);
+    pos += n;
+}
+```
+
+Python equivalent used in `_paint_rows_vg`: `''.join(chr(cp) for cp in codepoints[:count])`
+
+### R4 — Repaint rate: Ghostling unconditional 60 Hz (main.c:797)
+
+`SetTargetFPS(60)` — no adaptive rate, no dirty check.
+
+**Decision**: Use 30 Hz QTimer in Houdini gated on `_vt_dirty` to protect Houdini's Qt event loop from unnecessary repaints.
+
+### R5 — Font atlas structure (src/font/Atlas.zig)
+
+- **Storage**: Square power-of-2 texture (e.g. 1024×1024). Grayscale for alpha masks; BGRA for color emoji. 1-pixel border prevents GPU sampler bleed.
+- **Packing**: Shelf packing (best-fit) from "A Thousand Ways to Pack the Bin" (Jylänki). Node list tracks shelf segments. Adjacent same-y nodes merged after each reservation.
+- **Growth**: If `reserve(w,h)` returns AtlasFull, double texture size and re-upload. No eviction — `clear()` resets all nodes and zeroes data.
+- **Cache**: Atlas has NO built-in glyph cache. Callers maintain `dict[(codepoint, face_idx, size_px, bold, italic) → Region(x,y,w,h)]`.
+- **GPU sync**: `modified` atomic counter → `glTexSubImage2D` for updates; `resized` counter → `glTexImage2D` full re-upload.
+
+**Decision**: Deferred to Phase 5. The `FontAtlas` class in `_terminal.py` is a stub with this design documented in its docstring.
+
+### R6 — Cell metrics (src/font/Metrics.zig, src/font/face.zig)
+
+- Cell width: `@round(face_width)` — rounded advance width of ASCII printable reference character.
+- Cell height: `@round(lineHeight())` = ascent + descent + line gap.
+- Baseline offset: used for underline / strikethrough positioning relative to cell top.
+
+**Qt equivalent already in `_terminal.py`**: `QFontMetrics.horizontalAdvance('M')` for width, `QFontMetrics.height()` for height, `QFontMetrics.ascent()` for baseline — matches Ghostty's algorithm.
+
+### R7 — Scrollback (src/terminal/Screen.zig)
+
+PageList model with linked pages (bounded by `explicit_max_size`, unbounded if 0). Viewport is a union: `active | top | pin`. Pin-based tracking preserves positions across page rotations.
+
+**Decision**: libghostty-vt handles all scrollback internally. Void Ghostty exposes it via `QScrollBar` wired to `vg_scroll()` / `vg_scrollbar()` — no re-implementation needed.
+
+### R8 — Dirty flag propagation (src/terminal/Screen.zig)
+
+Propagation chain: Cell write → `page_row.dirty = true` → Page dirty → Screen-level `dirty.selection` / `dirty.hyperlink_hover`. Python only needs the global `_vt_dirty` Python flag; per-row bits are cleared in C inside `vg_render_row_cells()`.
+
+### Summary table
+
+| Decision | Finding | Source |
+|---|---|---|
+| Render all rows, no per-row skip | Ghostling does not skip clean rows | main.c:1078–1176 |
+| Wide chars: `unicodedata.east_asian_width` | No vg API for width, Ghostling ignores it | main.c:1087,1165 / BUILD_NOTES ABI notes |
+| Grapheme → `''.join(chr(cp)...)` | Direct port of Ghostling's UTF-8 encode loop | main.c:1104–1119 |
+| 30 Hz dirty-gated in Houdini | Ghostling uses 60 Hz unconditional | main.c:797 |
+| FontAtlas deferred, stub in place | Shelf packing, no eviction, caller-managed keys | src/font/Atlas.zig |
+| QFontMetrics already correct | Matches `@round(face_width)` / `lineHeight()` | src/font/Metrics.zig, face.zig |
+| Scrollback via vg_scroll* only | PageList fully internal to libghostty-vt | src/terminal/Screen.zig |
+| Python `_vt_dirty` gate sufficient | Per-row bits cleared in C by `vg_render_row_cells` | src/terminal/Screen.zig |

@@ -20,7 +20,7 @@
  * Build:
  *   Windows (MSVC):
  *     cl /LD /EHsc /O2 /std:c++20 src\_lib.cpp /I include
- *        /link bin\windows\ghostty-vt.lib /OUT:bin\windows\vg.dll
+ *        /link bin\windows\ghostty-vt.lib vcruntime.lib ucrt.lib /OUT:bin\windows\vg.dll
  *   Linux:
  *     g++ -std=c++20 -shared -fPIC src/_lib.cpp -Lbin/linux -lghostty-vt -Iinclude
  *         -Wl,-rpath,'$ORIGIN' -o bin/linux/libvg.so
@@ -98,6 +98,22 @@ VG_EXPORT void vg_terminal_resize(void* term,
                                 (uint32_t)cell_w_px, (uint32_t)cell_h_px);
 }
 
+/* Set the write-to-PTY callback.
+ *
+ * fn must match GhosttyTerminalWritePtyFn:
+ *   void(*)(GhosttyTerminal term, void* userdata, const uint8_t* data, size_t len)
+ *
+ * Passing NULL for fn clears the callback (libghostty then silently discards
+ * query responses).  ud is forwarded to every callback invocation.
+ *
+ * Call after vg_terminal_new() and before the first vg_terminal_write().
+ */
+VG_EXPORT void vg_terminal_set_write_pty_fn(void* term, void* fn, void* ud) {
+    if (!term) return;
+    ghostty_terminal_set((GhosttyTerminal)term, GHOSTTY_TERMINAL_OPT_USERDATA, ud);
+    ghostty_terminal_set((GhosttyTerminal)term, GHOSTTY_TERMINAL_OPT_WRITE_PTY, fn);
+}
+
 /* -------------------------------------------------------------------------
  * Render state
  * ---------------------------------------------------------------------- */
@@ -121,14 +137,59 @@ VG_EXPORT void vg_render_state_update(void* rs, void* term) {
  * Row / cell iteration
  * ---------------------------------------------------------------------- */
 
+/* Fill a VgCell from the current position of a GhosttyRenderStateRowCells
+ * iterator.  Called after ghostty_render_state_row_cells_next() returns true. */
+static void _fill_cell(VgCell* c, GhosttyRenderStateRowCells cells) {
+    memset(c, 0, sizeof(*c));
+
+    uint32_t glen = 0;
+    ghostty_render_state_row_cells_get(cells,
+        GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, &glen);
+    c->codepoint_count = (uint8_t)(glen < 16 ? glen : 16);
+
+    if (glen > 0) {
+        ghostty_render_state_row_cells_get(cells,
+            GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
+            c->codepoints);
+    }
+
+    GhosttyColorRgb fg = {0, 0, 0};
+    ghostty_render_state_row_cells_get(cells,
+        GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg);
+    c->fg_r = fg.r; c->fg_g = fg.g; c->fg_b = fg.b;
+
+    GhosttyColorRgb bg = {0, 0, 0};
+    c->has_bg = (ghostty_render_state_row_cells_get(cells,
+        GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg) == GHOSTTY_SUCCESS)
+        ? 1 : 0;
+    c->bg_r = bg.r; c->bg_g = bg.g; c->bg_b = bg.b;
+
+    GhosttyStyle style;
+    memset(&style, 0, sizeof(style));
+    style.size = sizeof(style);
+    ghostty_render_state_row_cells_get(cells,
+        GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
+    c->bold          = style.bold          ? 1 : 0;
+    c->italic        = style.italic        ? 1 : 0;
+    c->inverse       = style.inverse       ? 1 : 0;
+    c->underline     = style.underline     ? 1 : 0;
+    c->strikethrough = style.strikethrough ? 1 : 0;
+    c->faint         = style.faint         ? 1 : 0;
+}
+
 VG_EXPORT int vg_render_row_count(void* rs) {
     if (!rs) return 0;
     GhosttyRenderStateRowIterator row_iter = NULL;
-    if (ghostty_render_state_get((GhosttyRenderState)rs,
-            GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &row_iter) != GHOSTTY_SUCCESS)
+    if (ghostty_render_state_row_iterator_new(NULL, &row_iter) != GHOSTTY_SUCCESS)
         return 0;
+    if (ghostty_render_state_get((GhosttyRenderState)rs,
+            GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &row_iter) != GHOSTTY_SUCCESS) {
+        ghostty_render_state_row_iterator_free(row_iter);
+        return 0;
+    }
     int count = 0;
     while (ghostty_render_state_row_iterator_next(row_iter)) count++;
+    ghostty_render_state_row_iterator_free(row_iter);
     return count;
 }
 
@@ -138,9 +199,13 @@ VG_EXPORT int vg_render_row_cells(void* rs, int row_index,
     if (!rs || !out_cells || max_cells <= 0) return 0;
 
     GhosttyRenderStateRowIterator row_iter = NULL;
-    if (ghostty_render_state_get((GhosttyRenderState)rs,
-            GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &row_iter) != GHOSTTY_SUCCESS)
+    if (ghostty_render_state_row_iterator_new(NULL, &row_iter) != GHOSTTY_SUCCESS)
         return 0;
+    if (ghostty_render_state_get((GhosttyRenderState)rs,
+            GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &row_iter) != GHOSTTY_SUCCESS) {
+        ghostty_render_state_row_iterator_free(row_iter);
+        return 0;
+    }
 
     int cur = 0;
     while (ghostty_render_state_row_iterator_next(row_iter)) {
@@ -149,49 +214,20 @@ VG_EXPORT int vg_render_row_cells(void* rs, int row_index,
     }
 
     GhosttyRenderStateRowCells cells = NULL;
-    if (ghostty_render_state_row_get(row_iter,
-            GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) != GHOSTTY_SUCCESS)
+    if (ghostty_render_state_row_cells_new(NULL, &cells) != GHOSTTY_SUCCESS) {
+        ghostty_render_state_row_iterator_free(row_iter);
         return 0;
+    }
+    if (ghostty_render_state_row_get(row_iter,
+            GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) != GHOSTTY_SUCCESS) {
+        ghostty_render_state_row_cells_free(cells);
+        ghostty_render_state_row_iterator_free(row_iter);
+        return 0;
+    }
 
     int n = 0;
     while (n < max_cells && ghostty_render_state_row_cells_next(cells)) {
-        VgCell* c = &out_cells[n];
-        memset(c, 0, sizeof(*c));
-
-        uint32_t glen = 0;
-        ghostty_render_state_row_cells_get(cells,
-            GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, &glen);
-        c->codepoint_count = (uint8_t)(glen < 16 ? glen : 16);
-
-        if (glen > 0) {
-            ghostty_render_state_row_cells_get(cells,
-                GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
-                c->codepoints);
-        }
-
-        GhosttyColorRgb fg = {0, 0, 0};
-        ghostty_render_state_row_cells_get(cells,
-            GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg);
-        c->fg_r = fg.r; c->fg_g = fg.g; c->fg_b = fg.b;
-
-        GhosttyColorRgb bg = {0, 0, 0};
-        c->has_bg = (ghostty_render_state_row_cells_get(cells,
-            GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg) == GHOSTTY_SUCCESS)
-            ? 1 : 0;
-        c->bg_r = bg.r; c->bg_g = bg.g; c->bg_b = bg.b;
-
-        GhosttyStyle style;
-        memset(&style, 0, sizeof(style));
-        style.size = sizeof(style);
-        ghostty_render_state_row_cells_get(cells,
-            GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
-        c->bold          = style.bold          ? 1 : 0;
-        c->italic        = style.italic        ? 1 : 0;
-        c->inverse       = style.inverse       ? 1 : 0;
-        c->underline     = style.underline     ? 1 : 0;
-        c->strikethrough = style.strikethrough ? 1 : 0;
-        c->faint         = style.faint         ? 1 : 0;
-
+        _fill_cell(&out_cells[n], cells);
         n++;
     }
 
@@ -199,7 +235,87 @@ VG_EXPORT int vg_render_row_cells(void* rs, int row_index,
     ghostty_render_state_row_set(row_iter,
         GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, &clean);
 
+    ghostty_render_state_row_cells_free(cells);
+    ghostty_render_state_row_iterator_free(row_iter);
     return n;
+}
+
+/* -------------------------------------------------------------------------
+ * vg_render_row_cells_all — single-pass iterator over ALL rows.
+ *
+ * Fills out_cells (flat: row0 cells, then row1, ...) with stride cells_per_row.
+ * out_counts[i] = number of valid cells in row i.
+ * Returns number of rows filled (may be < max_rows if iterator runs out).
+ *
+ * One iterator pass in order, matching Ghostling's while(row_iterator_next) loop.
+ * ---------------------------------------------------------------------- */
+VG_EXPORT int vg_render_row_cells_all(void*  rs,
+                                       VgCell* out_cells,
+                                       int     cells_per_row,
+                                       int*    out_counts,
+                                       int     max_rows)
+{
+    if (!rs || !out_cells || !out_counts || cells_per_row <= 0 || max_rows <= 0) return 0;
+    memset(out_counts, 0, (size_t)max_rows * sizeof(int));
+
+    GhosttyRenderStateRowIterator row_iter = NULL;
+    if (ghostty_render_state_row_iterator_new(NULL, &row_iter) != GHOSTTY_SUCCESS)
+        return 0;
+    if (ghostty_render_state_get((GhosttyRenderState)rs,
+            GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &row_iter) != GHOSTTY_SUCCESS) {
+        ghostty_render_state_row_iterator_free(row_iter);
+        return 0;
+    }
+
+    /* Pre-allocate cells handle once — reused for every row (avoids per-row alloc). */
+    GhosttyRenderStateRowCells cells = NULL;
+    if (ghostty_render_state_row_cells_new(NULL, &cells) != GHOSTTY_SUCCESS) {
+        ghostty_render_state_row_iterator_free(row_iter);
+        return 0;
+    }
+
+    int row_count = 0;
+    while (row_count < max_rows &&
+           ghostty_render_state_row_iterator_next(row_iter))
+    {
+        VgCell* row_cells = out_cells + (size_t)row_count * cells_per_row;
+
+        if (ghostty_render_state_row_get(row_iter,
+                GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) != GHOSTTY_SUCCESS) {
+            row_count++;
+            continue;
+        }
+
+        int n = 0;
+        while (n < cells_per_row && ghostty_render_state_row_cells_next(cells)) {
+            _fill_cell(&row_cells[n], cells);
+            n++;
+        }
+        out_counts[row_count] = n;
+
+        bool clean = false;
+        ghostty_render_state_row_set(row_iter,
+            GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, &clean);
+
+        row_count++;
+    }
+
+    ghostty_render_state_row_cells_free(cells);
+    ghostty_render_state_row_iterator_free(row_iter);
+    return row_count;
+}
+
+/* Clear global dirty flag on the render state.
+ * Must be called after every frame to reset the DIRTY_PARTIAL / DIRTY_FULL state.
+ * Without this, vg_render_state_update() accumulates dirty marks across frames
+ * instead of tracking only what changed since the last render.
+ * Corresponds to BUILD_NOTES § "Mark global dirty clean".
+ */
+VG_EXPORT void vg_render_clear_dirty(void* rs) {
+    if (!rs) return;
+    GhosttyRenderStateDirty clean = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
+    ghostty_render_state_set((GhosttyRenderState)rs,
+        GHOSTTY_RENDER_STATE_OPTION_DIRTY, &clean);
 }
 
 VG_EXPORT void vg_render_colors(void* rs, VgColors* out) {

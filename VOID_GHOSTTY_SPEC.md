@@ -8,6 +8,23 @@
 
 ---
 
+## Build Progress
+
+| Phase | Status | Notes |
+|---|---|---|
+| 0 — Repo Scaffold + Package Loads | ✅ Complete | Package registers, `import void_ghostty` works |
+| 1 — Python Panel Opens | ✅ Complete | Pane tab appears in Houdini |
+| 2 — PTY + Shell | ✅ Complete | winpty on Windows, pyte fallback retained |
+| 3 — Three-Pane Layout | ✅ Complete | Dynamic split/close multiplexer (Ctrl+Shift+H/B/X), configurable panes |
+| 4 — libghostty Render Surface | ✅ Complete | `vg.dll` built and in use; full VT rendering, scrollback, mouse, key encoding |
+| 5 — pynvim Sync + Panel-Node Wiring | ⬜ Not started | `_nvim_sync` stub exists, wired to None |
+| 6 — Follow / Pinned / Free Modes | 🔶 Partial | Scaffolding in `_panel.py`; follow/pinned/free logic present but untested end-to-end |
+| 7 — Parameter Injection API | ⬜ Not started | `register()` stub exists in `__init__.py` |
+
+**Session ended 2026-04-12.** Phases 0–4 fully working. The multiplexer (Phase 3) was extended beyond the original spec — panes are dynamic (split/close at runtime) rather than a fixed three-pane layout. Next session: evaluate Phase 5, 6, or 7, or address remaining minor resize-debounce glitch in deeply nested splits (5+ panes).
+
+---
+
 ## What It Is
 
 Void Ghostty is a GPU-accelerated terminal development environment embedded inside Houdini as a native Python Panel, built on **libghostty** — the C core of the Ghostty terminal (github.com/ghostty-org/ghostty).
